@@ -2,7 +2,7 @@
 #include <SPI.h>
 #include <WildFire.h>
 #include <WildFire_CC3000.h>
-#include <SD.h>
+#include <SdFat.h>
 #include <RTClib.h>
 #include <RTC_DS3231.h>
 #include <Time.h>
@@ -11,20 +11,22 @@
 #include <MCP342x.h>
 #include <LMP91000.h>
 #include <WildFire_SPIFlash.h>
-#include <Time.h>
 #include <CapacitiveSensor.h>
 #include <LiquidCrystal.h>
 #include <PubSubClient.h>
 #include <util/crc16.h>
+#include <math.h>
 
 // semantic versioning - see http://semver.org/
 #define AQEV2FW_MAJOR_VERSION 2
 #define AQEV2FW_MINOR_VERSION 0
-#define AQEV2FW_PATCH_VERSION 2
+#define AQEV2FW_PATCH_VERSION 5
 
-#define MQTT_TOPIC_PREFIX "/orgs/BreatheHeathrow/"
-#define DEVICE_NAME "CC3000" // this is used for smart config
 #define WLAN_SEC_AUTO (10) // made up to support auto-config of security
+
+// the start address of the second to last 4k page, where config is backed up off MCU
+// the last page is reserved for use by the bootloader
+#define SECOND_TO_LAST_4K_PAGE_ADDRESS      0x7E000     
 
 WildFire wf;
 WildFire_CC3000 cc3000;
@@ -41,6 +43,7 @@ PubSubClient mqtt_client;
 char mqtt_client_id[32] = {0};
 WildFire_CC3000_Client wifiClient;
 RTC_DS3231 rtc;
+SdFat SD;
 
 uint32_t update_server_ip32 = 0;
 char update_server_name[32] = {0};
@@ -55,7 +58,7 @@ boolean allowed_to_write_config_eeprom = false;
 unsigned long current_millis = 0;
 char firmware_version[16] = {0};
 uint8_t temperature_units = 'C';
-float reported_temperature_offset_degC = 3.5f;
+float reported_temperature_offset_degC = 0.0f;
 float reported_humidity_offset_percent = 0.0f;
 
 float temperature_degc = 0.0f;
@@ -140,7 +143,7 @@ uint8_t mode = MODE_OPERATIONAL;
 #define EEPROM_CO_CAL_SLOPE       (EEPROM_CO_SENSITIVITY - 4)     // float value, 4-bytes, the slope applied to the sensor
 #define EEPROM_CO_CAL_OFFSET      (EEPROM_CO_CAL_SLOPE - 4)       // float value, 4-bytes, the offset applied to the sensor
 #define EEPROM_PRIVATE_KEY        (EEPROM_CO_CAL_OFFSET - 32)     // 32-bytes of Random Data (256-bits)
-#define EEPROM_MQTT_SERVER_NAME   (EEPROM_PRIVATE_KEY - 32)       // string, the DNS name of the MQTT server (default opensensors.io), up to 32 characters (one of which is a null terminator)
+#define EEPROM_MQTT_SERVER_NAME   (EEPROM_PRIVATE_KEY - 32)       // string, the DNS name of the MQTT server (default mqtt.opensensors.io), up to 32 characters (one of which is a null terminator)
 #define EEPROM_MQTT_USERNAME      (EEPROM_MQTT_SERVER_NAME - 32)  // string, the user name for the MQTT server (default wickeddevice), up to 32 characters (one of which is a null terminator)
 #define EEPROM_MQTT_CLIENT_ID     (EEPROM_MQTT_USERNAME - 32)     // string, the client identifier for the MQTT server (default SHT25 identifier), between 1 and 23 characters long
 #define EEPROM_MQTT_AUTH          (EEPROM_MQTT_CLIENT_ID - 1)     // MQTT authentication enabled, single byte value 0 = disabled or 1 = enabled
@@ -156,6 +159,8 @@ uint8_t mode = MODE_OPERATIONAL;
 #define EEPROM_SAMPLING_INTERVAL  (EEPROM_BACKLIGHT_STARTUP - 2)  // integer value, number of seconds between sensor samplings
 #define EEPROM_REPORTING_INTERVAL (EEPROM_SAMPLING_INTERVAL - 2)  // integer value, number of seconds between sensor reports
 #define EEPROM_AVERAGING_INTERVAL (EEPROM_REPORTING_INTERVAL - 2) // integer value, number of seconds of samples averaged
+#define EEPROM_ALTITUDE_METERS    (EEPROM_AVERAGING_INTERVAL - 2) // signed integer value, 2-bytes, the altitude in meters above sea level, where the Egg is located
+#define EEPROM_MQTT_TOPIC_PREFIX  (EEPROM_ALTITUDE_METERS - 64)   // up to 64-character string, prefix prepended to logical sensor topics
 //  /\
 //   L Add values up here by subtracting offsets to previously added values
 //   * ... and make sure the addresses don't collide and start overlapping!
@@ -180,8 +185,6 @@ uint8_t mode = MODE_OPERATIONAL;
 // valid connection methods
 // only DIRECT is supported initially
 #define CONNECT_METHOD_DIRECT        (0)
-#define CONNECT_METHOD_SMARTCONFIG   (1)
-#define CONNECT_METHOD_PFOD          (2)
 
 // backup status bits
 #define BACKUP_STATUS_MAC_ADDRESS_BIT             (7)
@@ -215,6 +218,7 @@ void set_mqtt_port(char * arg);
 void set_mqtt_username(char * arg);
 void set_mqtt_client_id(char * arg);
 void set_mqtt_authentication(char * arg);
+void set_mqtt_topic_prefix(char * arg);
 void backup(char * arg);
 void set_no2_slope(char * arg);
 void set_no2_offset(char * arg);
@@ -235,6 +239,8 @@ void list_command(char * arg);
 void download_command(char * arg);
 void delete_command(char * arg);
 void sampling_command(char * arg);
+void altitude_command(char * arg);
+
 // Note to self:
 //   When implementing a new parameter, ask yourself:
 //     should there be a command for the user to set its value directly
@@ -270,6 +276,7 @@ char * commands[] = {
   "mqttpwd    ",  
   "mqttid     ",
   "mqttauth   ",
+  "mqttprefix ",
   "updatesrv  ",
   "backup     ",
   "no2_sen    ",
@@ -291,6 +298,7 @@ char * commands[] = {
   "download   ",
   "delete     ",
   "sampling   ", 
+  "altitude   ",
   0
 };
 
@@ -311,6 +319,7 @@ void (*command_functions[])(char * arg) = {
   set_mqtt_password,  
   set_mqtt_client_id,
   set_mqtt_authentication,
+  set_mqtt_topic_prefix,
   set_update_server_name,
   backup,
   set_no2_sensitivity,
@@ -332,6 +341,7 @@ void (*command_functions[])(char * arg) = {
   download_command,
   delete_command,
   sampling_command,
+  altitude_command,
   0
 };
 
@@ -368,10 +378,20 @@ char scratch[1024] = { 0 };  // scratch buffer, for general use
 char converted_value_string[64] = {0};
 char compensated_value_string[64] = {0};
 char raw_value_string[64] = {0};
+char MQTT_TOPIC_STRING[128] = {0};
+char MQTT_TOPIC_PREFIX[64] = "/orgs/BreatheHeathrow/";
 
+const char * header_row = "Timestamp,"
+               "Temperature[degC],"
+               "Humidity[percent],"                   
+               "NO2[ppb],"                    
+               "CO[ppm],"      
+               "NO2[V]," 
+               "CO[V]";        
 
 void setup() {
   boolean integrity_check_passed = false;
+  boolean mirrored_config_mismatch = false;
   boolean valid_ssid_passed = false; 
   
   // initialize hardware
@@ -397,6 +417,7 @@ void setup() {
     allowed_to_write_config_eeprom = false;
   }
   else if(!mirrored_config_matches_eeprom_config()){
+    mirrored_config_mismatch = true;
     Serial.println(F("Info: Startup config integrity check passed, but mirrored config differs, attempting to restore from mirrored configuration."));
     allowed_to_write_config_eeprom = true;
     integrity_check_passed = mirrored_config_restore_and_validate();
@@ -423,7 +444,14 @@ void setup() {
       mode = MODE_CONFIG;
       allowed_to_write_config_eeprom = true;
     }
-    else if(!integrity_check_passed) {      
+    else if(!integrity_check_passed && !mirrored_config_mismatch) { 
+      // if there was not a mirrored config mismatch and integrity check did not pass
+      // that means startup config integrity check failed, and restoring from mirror configuration failed
+      // to result in a valid configuration as well
+      //
+      // if, on the other hand, there was a mirrored config mismatch, the logic above *implies* that the eeprom config 
+      // is valid and that the mirrored config is not (yet) valid, so we shouldn't go into this case, and instead 
+      // we should drop into the else case (i.e. what normally happens on a startup with a valid configuration)
       Serial.println(F("Info: Config memory integrity check failed, automatically falling back to CONFIG mode."));
       configInject("aqe\r");
       Serial.println();
@@ -588,10 +616,7 @@ void setup() {
   if(mode_requires_wifi(mode)){
     // Scan Networks to show RSSI    
     uint8_t connect_method = eeprom_read_byte((const uint8_t *) EEPROM_CONNECT_METHOD);    
-    if(connect_method != CONNECT_METHOD_SMARTCONFIG){
-      displayRSSI(); // not sure this will work if Smart Config is used
-    }
-    
+    displayRSSI();         
     delayForWatchdog();
     petWatchdog();
     
@@ -668,12 +693,11 @@ void setup() {
 
 void loop() {
   current_millis = millis();
-
  
   if(current_millis - previous_sensor_sampling_millis >= sampling_interval){
     previous_sensor_sampling_millis = current_millis;    
-    Serial.print(F("Info: Sampling Sensors @ "));
-    Serial.println(millis());
+    //Serial.print(F("Info: Sampling Sensors @ "));
+    //Serial.println(millis());
     collectNO2();
     collectCO();
     collectTemperature();
@@ -703,7 +727,7 @@ void loop() {
   // pet the watchdog
   if (current_millis - previous_tinywdt_millis >= tinywdt_interval) {
     previous_tinywdt_millis = current_millis;
-    Serial.println(F("Info: Watchdog Pet."));
+    //Serial.println(F("Info: Watchdog Pet."));
     delayForWatchdog();
     petWatchdog();
   }
@@ -938,20 +962,7 @@ void initializeHardware(void) {
   Serial.print(F("Info: CC3000 Initialization..."));  
   SUCCESS_MESSAGE_DELAY(); // don't race past the splash screen, and give watchdog some breathing room
   petWatchdog();
-  if(connect_method == CONNECT_METHOD_SMARTCONFIG){
-    setLCD_P(PSTR("  SMART CONFIG  "
-                  "  RECONNECTING  "));
-    if (cc3000.begin(false, true, DEVICE_NAME)){
-      lcdSmiley(15, 1);
-      Serial.println("OK.");
-    }
-    else{
-      Serial.println("Failed.");
-      updateLCD("FAILED", 1);
-      lcdFrownie(15, 1);      
-    }
-  }
-  else{
+    
     if (cc3000.begin()) {
       Serial.println(F("OK."));
       init_cc3000_ok = true;
@@ -960,12 +971,16 @@ void initializeHardware(void) {
       Serial.println(F("Failed."));
       init_cc3000_ok = false;
     }
-  } 
+  
+  updateLCD("NO2 / CO", 0);
+  updateLCD("MODEL", 1);
+  SUCCESS_MESSAGE_DELAY();  
+  
 }
 
 /****** CONFIGURATION SUPPORT FUNCTIONS ******/
 void initializeNewConfigSettings(void){
-  static char command_buf[32] = {0};
+  static char command_buf[128] = {0};
   boolean in_config_mode = false; 
   allowed_to_write_config_eeprom = true;
   
@@ -1001,9 +1016,10 @@ void initializeNewConfigSettings(void){
       configInject("aqe\r");
       in_config_mode = true;
     }    
-    memset(command_buf, 0, 32);  
-    snprintf(command_buf, 31, "no2_sen %8.4f\r", sensitivity);
+    memset(command_buf, 0, 128);  
+    snprintf(command_buf, 127, "no2_sen %8.4f\r", sensitivity);
     configInject(command_buf);
+    configInject("backup no2\r");
   }
   
   sensitivity = eeprom_read_float((const float *) EEPROM_CO_SENSITIVITY);  
@@ -1014,9 +1030,36 @@ void initializeNewConfigSettings(void){
       configInject("aqe\r");
       in_config_mode = true;
     }    
-    memset(command_buf, 0, 32);  
-    snprintf(command_buf, 31, "co_sen %8.4f\r", sensitivity);
+    memset(command_buf, 0, 128);  
+    snprintf(command_buf, 127, "co_sen %8.4f\r", sensitivity);
     configInject(command_buf);  
+    configInject("backup co\r");
+  }  
+
+  // if necessary, initialize the default mqtt prefix
+  // if it's never been set, the first byte in memory will be 0xFF
+  uint8_t val = eeprom_read_byte((const uint8_t *) EEPROM_MQTT_TOPIC_PREFIX);  
+  if(val == 0xFF){
+    if(!in_config_mode){
+      configInject("aqe\r");
+      in_config_mode = true;
+    }    
+    memset(command_buf, 0, 128);
+    strcat(command_buf, "mqttprefix ");
+    strcat(command_buf, MQTT_TOPIC_PREFIX);
+    strcat(command_buf, "\r");
+    configInject(command_buf);
+  }
+
+  // if the mqtt server is set to opensensors.io, change it to mqtt.opensensors.io
+  memset(command_buf, 0, 128);
+  eeprom_read_block(command_buf, (const void *) EEPROM_MQTT_SERVER_NAME, 31);
+  if(strcmp_P(command_buf, PSTR("opensensors.io")) == 0){
+    if(!in_config_mode){
+      configInject("aqe\r");
+      in_config_mode = true;
+    }    
+    configInject("mqttsrv mqtt.opensensors.io\r");
   }
   
   if(in_config_mode){
@@ -1027,8 +1070,8 @@ void initializeNewConfigSettings(void){
 }
 
 boolean checkConfigIntegrity(void) {
-  uint16_t computed_crc = computeConfigChecksum();
-  uint16_t stored_crc = eeprom_read_word((const uint16_t *) EEPROM_CRC_CHECKSUM);
+  uint16_t computed_crc = computeEepromChecksum();
+  uint16_t stored_crc = getStoredEepromChecksum();
   if (computed_crc == stored_crc) {
     return true;
   }
@@ -1308,6 +1351,7 @@ void help_menu(char * arg) {
       Serial.println(F("      sampleint - the sensor sampling interval in seconds"));
       Serial.println(F("      reportint - the reporting sampling interval in seconds"));
       Serial.println(F("      avgint - the sensor averaging interval in seconds"));
+      Serial.println(F("      altitude - the altitude of the sensor in meters above sea level"));
       Serial.println(F("   result: the current, human-readable, value of <param>"));
       Serial.println(F("           is printed to the console."));
     }
@@ -1316,7 +1360,6 @@ void help_menu(char * arg) {
       Serial.println(F("   <param> is one of:"));
       Serial.println(F("      mac         - retrieves the mac address from"));
       Serial.println(F("                    the CC3000 and stores it in EEPROM"));
-      Serial.println(F("      smartconfig - initiate the SmartConfig profile creation process"));
     }
     else if (strncmp("restore", arg, 7) == 0) {
       Serial.println(F("restore <param>"));
@@ -1326,15 +1369,17 @@ void help_menu(char * arg) {
       Serial.println(F("                   performs 'use dhcp'"));
       Serial.println(F("                   performs 'opmode normal'"));
       Serial.println(F("                   performs 'tempunit C'"));      
+      Serial.println(F("                   performs 'altitude -1")); 
       Serial.println(F("                   performs 'backlight 60'"));
       Serial.println(F("                   performs 'backlight initon'"));      
-      Serial.println(F("                   performs 'mqttsrv opensensors.io'"));
+      Serial.println(F("                   performs 'mqttsrv mqtt.opensensors.io'"));
       Serial.println(F("                   performs 'mqttport 1883'"));           
       Serial.println(F("                   performs 'mqttauth enable'"));        
       Serial.println(F("                   performs 'mqttuser wickeddevice'"));  
-      Serial.println(F("                   performs 'temp_off 3.5'"));      
-      Serial.println(F("                   performs 'hum_off 0.0'"));    
+      Serial.println(F("                   performs 'mqttprefix /orgs/BreatheHeathrow/'"));
       Serial.println(F("                   performs 'sampling 5, 160, 5'"));
+      Serial.println(F("                   performs 'restore temp_off'"));      
+      Serial.println(F("                   performs 'restore hum_off'"));          
       Serial.println(F("                   performs 'restore mac'"));
       Serial.println(F("                   performs 'restore mqttpwd'"));
       Serial.println(F("                   performs 'restore mqttid'"));      
@@ -1369,8 +1414,6 @@ void help_menu(char * arg) {
       Serial.println(F("method <type>"));
       Serial.println(F("   <type> is one of:"));
       Serial.println(F("      direct - use parameters entered in CONFIG mode"));
-      Serial.println(F("      smartconfig - use smart config process"));
-      Serial.println(F("      pfod - use pfodWifiConnect config process  [not yet supported]"));
       warn_could_break_connect();      
     }
     else if (strncmp("ssid", arg, 4) == 0) {
@@ -1419,10 +1462,14 @@ void help_menu(char * arg) {
     else if (strncmp("download", arg, 8) == 0) {
       Serial.println(F("download <filename>"));
       Serial.println(F("   prints the contents of the named file to the console."));
+      Serial.println(F("download <YYMMDDHH> <YYMMDDHH>"));      
+      Serial.println(F("   prints the contents of files from start to end dates inclusive."));
     }   
     else if (strncmp("delete", arg, 6) == 0) {
       Serial.println(F("delete <filename>"));
       Serial.println(F("   deletes the named file from the SD card."));
+      Serial.println(F("delete <YYMMDDHH> <YYMMDDHH>"));      
+      Serial.println(F("   deletes the files from start to end dates inclusive."));
     }       
     else if (strncmp("force", arg, 5) == 0) {
       Serial.println(F("force <param>"));
@@ -1470,6 +1517,12 @@ void help_menu(char * arg) {
       note_know_what_youre_doing();
       warn_could_break_upload();   
     }        
+    else if (strncmp("mqttprefix", arg, 10) == 0) {
+      Serial.println(F("mqttprefix <string>"));
+      Serial.println(F("   <string> is pre-pended to the logical topic for each sensor"));
+      note_know_what_youre_doing();
+      warn_could_break_upload();   
+    }        
     else if (strncmp("mqttport", arg, 8) == 0) {
       Serial.println(F("mqttport <number>"));
       Serial.println(F("   <number> is the a number between 1 and 65535 inclusive"));
@@ -1479,8 +1532,8 @@ void help_menu(char * arg) {
     else if (strncmp("updatesrv", arg, 9) == 0) {
       Serial.println(F("updatesrv <string>"));
       Serial.println(F("   <string> is the DNS name of the Update server."));
-      Serial.println(F("   note:    Unless you *really* know what you're doing, you should"));
-      Serial.println(F("            probably not be using this command."));
+      Serial.println(F("   note: to disable internet firmware updates type 'updatesrv disable'"));
+      Serial.println(F("         to re-enable internet firmware updates type 'restore updatesrv'"));
       Serial.println(F("   warning: Using this command incorrectly can prevent your device"));
       Serial.println(F("            from getting firmware updates over the internet."));
     }   
@@ -1547,14 +1600,19 @@ void help_menu(char * arg) {
       Serial.println(F("opmode <mode>"));
       Serial.println(F("   <mode> is one of:"));
       Serial.println(F("      normal - publish data to MQTT server over Wi-Fi"));
-      Serial.println(F("      offline - this mode writes data to an installed microSD card, creating one file per day, "));
-      Serial.println(F("                named by convention YYYYMMDD.csv, intended to be used in conjunction with RTC module"));
+      Serial.println(F("      offline - this mode writes data to an installed microSD card, creating one file per hour, "));
+      Serial.println(F("                named by convention YYMMDDHH.csv, intended to be used in conjunction with RTC module"));
     }    
     else if (strncmp("tempunit", arg, 8) == 0) {
       Serial.println(F("tempunit <unit>"));
       Serial.println(F("   <unit> is one of:"));      
       Serial.println(F("      C - report temperature in Celsius"));
       Serial.println(F("      F - report temperature in Fahrenheit"));
+    }
+    else if (strncmp("altitude", arg, 8) == 0) {
+      Serial.println(F("altitude <number>"));
+      Serial.println(F("   <number> is the height above sea level where the Egg is [meters]"));   
+      Serial.println(F("   Note: -1 is a special value meaning do not apply pressure compensation"));
     }
     else if (strncmp("datetime", arg, 8) == 0) {
       Serial.println(F("datetime <csv-date-time>"));
@@ -1603,12 +1661,6 @@ void print_eeprom_connect_method(void) {
     case CONNECT_METHOD_DIRECT:
       Serial.println(F("Direct Connect"));
       break;
-    case CONNECT_METHOD_SMARTCONFIG:
-      Serial.println(F("Smart Config Connect"));
-      break;
-    case CONNECT_METHOD_PFOD:
-      Serial.println(F("Pfod Wi-Fi Connect [not currently supported]"));
-      break;
     default:
       Serial.print(F("Error: Unknown connection method code [0x"));
       if (method < 0x10) {
@@ -1624,6 +1676,7 @@ boolean valid_ssid_config(void) {
   char ssid[32] = {0};
   boolean ssid_contains_only_printables = true;
 
+  uint8_t connect_method = eeprom_read_byte((const uint8_t *) EEPROM_CONNECT_METHOD);      
   eeprom_read_block(ssid, (const void *) EEPROM_SSID, 31);
   for (uint8_t ii = 0; ii < 32; ii++) {
     if (ssid[ii] == '\0') {
@@ -1763,8 +1816,20 @@ void print_eeprom_string(const char * address){
   Serial.println(tmp);
 }
 
+void print_eeprom_string(const char * address, const char * unless_it_matches_this, const char * in_which_case_print_this_instead){
+  char tmp[32] = {0};
+  eeprom_read_block(tmp, (const void *) address, 31);
+
+  if(strcmp(tmp, unless_it_matches_this) == 0){
+    Serial.println(in_which_case_print_this_instead);
+  }
+  else{
+    Serial.println(tmp);
+  }
+}
+
 void print_eeprom_update_server(){
-  print_eeprom_string((const char *) EEPROM_UPDATE_SERVER_NAME);
+  print_eeprom_string((const char *) EEPROM_UPDATE_SERVER_NAME, "", "Disabled");
 }
 
 void print_eeprom_update_filename(){
@@ -1778,6 +1843,10 @@ void print_eeprom_mqtt_server(){
 
 void print_eeprom_mqtt_client_id(){
   print_eeprom_string((const char *) EEPROM_MQTT_CLIENT_ID);
+}
+
+void print_eeprom_mqtt_topic_prefix(){
+  print_eeprom_string((const char *) EEPROM_MQTT_TOPIC_PREFIX);
 }
 
 void print_eeprom_mqtt_username(){
@@ -1833,6 +1902,17 @@ void print_eeprom_temperature_units(){
       Serial.println(F("]"));
       break;
   }  
+}
+
+void print_altitude_settings(void){
+  int16_t l_altitude = (int16_t) eeprom_read_word((uint16_t *) EEPROM_ALTITUDE_METERS);
+  if(l_altitude != -1){
+    Serial.print(l_altitude);
+    Serial.println(F(" meters"));  
+  }
+  else{
+    Serial.println("Not set");
+  }
 }
 
 void print_eeprom_backlight(){   
@@ -1925,7 +2005,7 @@ void print_eeprom_value(char * arg) {
     Serial.println();
   } 
   else if(strncmp(arg, "updatesrv", 9) == 0) {
-    print_eeprom_string((const char *) EEPROM_UPDATE_SERVER_NAME);    
+    print_eeprom_update_server();    
   }  
   else if(strncmp(arg, "updatefile", 10) == 0) {
     print_eeprom_string((const char *) EEPROM_UPDATE_FILENAME);    
@@ -1938,9 +2018,12 @@ void print_eeprom_value(char * arg) {
   }     
   else if(strncmp(arg, "avgint", 6) == 0) {
     Serial.println(eeprom_read_word((uint16_t *) EEPROM_AVERAGING_INTERVAL));    
+  } 
+  else if(strncmp(arg, "altitude", 8) == 0) {
+    Serial.println((int16_t) eeprom_read_word((uint16_t *) EEPROM_ALTITUDE_METERS));    
   }     
   else if (strncmp(arg, "settings", 8) == 0) {
-    char allff[64] = {0};
+    static char allff[64] = {0};
     memset(allff, 0xff, 64);
 
     // print all the settings to the screen in an orderly fashion
@@ -1951,6 +2034,8 @@ void print_eeprom_value(char * arg) {
     print_eeprom_operational_mode(eeprom_read_byte((const uint8_t *) EEPROM_OPERATIONAL_MODE));
     Serial.print(F("    Temperature Units: "));
     print_eeprom_temperature_units();
+    Serial.print(F("    Altitude: "));
+    print_altitude_settings();
     Serial.print(F("    Backlight Settings: "));
     print_eeprom_backlight();
     Serial.print(F("    Sensor Sampling Interval: "));
@@ -1971,12 +2056,10 @@ void print_eeprom_value(char * arg) {
     uint8_t connect_method = eeprom_read_byte((const uint8_t *) EEPROM_CONNECT_METHOD);
     Serial.print(F("    Method: "));    
     print_eeprom_connect_method();
-    if(connect_method != CONNECT_METHOD_SMARTCONFIG){    
-      Serial.print(F("    SSID: "));
-      print_eeprom_ssid();
-      Serial.print(F("    Security Mode: "));
-      print_eeprom_security_type();
-    }
+    Serial.print(F("    SSID: "));
+    print_eeprom_ssid();
+    Serial.print(F("    Security Mode: "));
+    print_eeprom_security_type();
     Serial.print(F("    IP Mode: "));
     print_eeprom_ipmode();
     Serial.print(F("    Update Server: "));
@@ -1993,6 +2076,8 @@ void print_eeprom_value(char * arg) {
     Serial.print(F("    MQTT Client ID: "));
     print_eeprom_mqtt_client_id();       
     print_eeprom_mqtt_authentication(); 
+    Serial.print(F("    MQTT Topic Prefix: "));
+    print_eeprom_mqtt_topic_prefix();
     Serial.println(F(" +-------------------------------------------------------------+"));
     Serial.println(F(" | Credentials:                                                |"));
     Serial.println(F(" +-------------------------------------------------------------+"));
@@ -2062,31 +2147,6 @@ void initialize_eeprom_value(char * arg) {
       recomputeAndStoreConfigChecksum();
     }
   }
-  else if(strncmp(arg, "smartconfig", 11) == 0){
-    Serial.println(F("Info: Waiting for a SmartConfig connection..."));
-    setLCD_P(PSTR("    STARTING    "    
-                  "  SMART CONFIG  "));
-    delayForWatchdog();
-    petWatchdog();
-    if (!cc3000.startSmartConfig(DEVICE_NAME)){
-      delayForWatchdog();
-      petWatchdog();        
-      Serial.println(F("Error: SmartConfig Create Failed."));
-      lcdFrownie(15, 1);
-      ERROR_MESSAGE_DELAY();
-    }    
-    else{
-      delayForWatchdog();
-      petWatchdog();              
-      Serial.println(F("Info: Saved connection details and connected to AP!"));    
-      configInject("method smartconfig\r");
-      lcdSmiley(15, 1);
-      ERROR_MESSAGE_DELAY();
-    }
-    
-    clearLCD();   
-    setLCD_P(PSTR("  CONFIG MODE"));    
-  }
   else {
     Serial.print(F("Error: Unexpected Variable Name \""));
     Serial.print(arg);
@@ -2119,15 +2179,17 @@ void restore(char * arg) {
     configInject("use dhcp\r");
     configInject("opmode normal\r");
     configInject("tempunit C\r");    
+    configInject("altitude -1\r");    
     configInject("backlight 60\r");
     configInject("backlight initon\r");
-    configInject("mqttsrv opensensors.io\r");
+    configInject("mqttsrv mqtt.opensensors.io\r");
     configInject("mqttport 1883\r");        
     configInject("mqttauth enable\r");    
     configInject("mqttuser wickeddevice\r");
-    configInject("temp_off 3.5\r");
-    configInject("hum_off 0.0\r");  
+    configInject("mqttprefix /orgs/BreatheHeathrow/\r");
     configInject("sampling 5, 160, 5\r");    
+    configInject("restore temp_off\r");
+    configInject("restore hum_off\r");       
     configInject("restore mqttpwd\r");
     configInject("restore mqttid\r");
     configInject("restore updatesrv\r");
@@ -2210,7 +2272,7 @@ void restore(char * arg) {
     eeprom_read_block(tmp, (const void *) EEPROM_BACKUP_PRIVATE_KEY, 32);
     eeprom_write_block(tmp, (void *) EEPROM_PRIVATE_KEY, 32);
   }
-  else if (strncmp("no2", arg, 6) == 0) {
+  else if (strncmp("no2", arg, 3) == 0) {
     if (!BIT_IS_CLEARED(backup_check, BACKUP_STATUS_NO2_CALIBRATION_BIT)) {
       Serial.println(F("Error: NO2 calibration must be backed up  "));
       Serial.println(F("       prior to executing a 'restore'."));
@@ -2240,23 +2302,25 @@ void restore(char * arg) {
   }
   else if (strncmp("temp_off", arg, 8) == 0) {
     if (!BIT_IS_CLEARED(backup_check, BACKUP_STATUS_TEMPERATURE_CALIBRATION_BIT)) {
-      Serial.println(F("Error: Temperature reporting offset must be backed up  "));
-      Serial.println(F("       prior to executing a 'restore'."));
-      return;
+      Serial.println(F("Error: Temperature reporting offset should be backed up  "));
+      Serial.println(F("       prior to executing a 'restore'. Setting to 0.0"));
+      eeprom_write_float((float *) EEPROM_TEMPERATURE_OFFSET, 0.0f);  
     }
-
-    eeprom_read_block(tmp, (const void *) EEPROM_BACKUP_TEMPERATURE_OFFSET, 4);
-    eeprom_write_block(tmp, (void *) EEPROM_TEMPERATURE_OFFSET, 4);
+    else{
+      eeprom_read_block(tmp, (const void *) EEPROM_BACKUP_TEMPERATURE_OFFSET, 4);
+      eeprom_write_block(tmp, (void *) EEPROM_TEMPERATURE_OFFSET, 4);
+    }
   }
   else if (strncmp("hum_off", arg, 7) == 0) {
     if (!BIT_IS_CLEARED(backup_check, BACKUP_STATUS_HUMIDITY_CALIBRATION_BIT)) {
-      Serial.println(F("Error: Humidity reporting offset must be backed up  "));
-      Serial.println(F("       prior to executing a 'restore'."));
-      return;
+      Serial.println(F("Warning: Humidity reporting offset should be backed up  "));
+      Serial.println(F("         prior to executing a 'restore'. Setting to 0.0."));   
+      eeprom_write_float((float *) EEPROM_HUMIDITY_OFFSET, 0.0f);
     }
-
-    eeprom_read_block(tmp, (const void *) EEPROM_BACKUP_HUMIDITY_OFFSET, 4);
-    eeprom_write_block(tmp, (void *) EEPROM_HUMIDITY_OFFSET, 4);
+    else{
+      eeprom_read_block(tmp, (const void *) EEPROM_BACKUP_HUMIDITY_OFFSET, 4);
+      eeprom_write_block(tmp, (void *) EEPROM_HUMIDITY_OFFSET, 4);
+    }
   }
   else {
     valid = false;
@@ -2319,6 +2383,23 @@ void set_backlight_behavior(char * arg){
   
   if (valid) {
     recomputeAndStoreConfigChecksum();
+  }  
+}
+
+void altitude_command(char * arg){
+  if(!configMemoryUnlocked(__LINE__)){
+    return;
+  }
+
+  char * endptr = NULL;
+  trim_string(arg);
+  int16_t l_altitude = (int16_t) strtol(arg, &endptr, 10);
+  if(*endptr == NULL){
+    eeprom_write_word((uint16_t *) EEPROM_ALTITUDE_METERS, l_altitude);
+    recomputeAndStoreConfigChecksum();
+  }
+  else{
+    Serial.println(F("Error: altitude must be a numeric"));
   }  
 }
 
@@ -2615,17 +2696,11 @@ void set_connection_method(char * arg) {
       Serial.println(F("Failed.")); 
     }
   }
-  else if (strncmp(arg, "smartconfig", 11) == 0) {
-    eeprom_write_byte((uint8_t *) EEPROM_CONNECT_METHOD, CONNECT_METHOD_SMARTCONFIG);
-  }
-  else if (strncmp(arg, "pfod", 4) == 0) {
-    eeprom_write_byte((uint8_t *) EEPROM_CONNECT_METHOD, CONNECT_METHOD_PFOD);
-  }
   else {
     Serial.print(F("Error: Invalid connection method entered - \""));
     Serial.print(arg);
     Serial.println(F("\""));
-    Serial.println(F("       valid options are: 'direct', 'smartconfig', and 'pfod'"));
+    Serial.println(F("       valid options are: 'direct'"));
     valid = false;
   }
 
@@ -2932,7 +3007,9 @@ void printDirectory(File dir, int numTabs) {
      for (uint8_t i=0; i<numTabs; i++) {
        Serial.print(F("\t"));
      }
-     Serial.print(entry.name());
+     char tmp[16] = {0};
+     entry.getName(tmp, 16);
+     Serial.print(tmp);
      if (entry.isDirectory()) {
        Serial.println(F("/"));
        printDirectory(entry, numTabs+1);
@@ -2949,8 +3026,9 @@ void printDirectory(File dir, int numTabs) {
 void list_command(char * arg){
   if (strncmp("files", arg, 5) == 0){
     if(init_sdcard_ok){
-      File root = SD.open("/");
+      File root = SD.open("/", FILE_READ);
       printDirectory(root, 0);      
+      root.close();       
     }
     else{
       Serial.println(F("Error: SD Card is not initialized, can't list files."));
@@ -2963,37 +3041,136 @@ void list_command(char * arg){
   }
 }
 
-void download_command(char * arg){
-  if(arg != NULL && init_sdcard_ok){
-    File dataFile = SD.open(arg);
+void download_one_file(char * filename){
+  if(filename != NULL && init_sdcard_ok){    
+    File dataFile = SD.open(filename, FILE_READ);
+    char last_char_read = NULL;
     if (dataFile) {
       while (dataFile.available()) {
-        Serial.write(dataFile.read());
+        last_char_read = dataFile.read();
+        Serial.write(last_char_read);
       }
       dataFile.close();      
     }
-    else {
-      Serial.print("Error: Failed to open file named \"");
-      Serial.print(arg);
-      Serial.print(F("\""));
-    }    
-  }
-  Serial.println();  
+    //else {
+    //  Serial.print("Error: Failed to open file named \"");
+    //  Serial.print(filename);
+    //  Serial.print(F("\""));
+    //}    
+    if(last_char_read != '\n'){
+      Serial.println();        
+    }
+  }  
 }
 
-void delete_command(char * arg){
-  if(arg != NULL && init_sdcard_ok){
-    if (SD.remove(arg)) {
+void crack_datetime_filename(char * filename, uint8_t target_array[4]){
+  char temp_str[3] = {0, 0, 0};   
+  for(uint8_t ii = 0; ii < 4; ii++){
+    strncpy(temp_str, &(filename[ii * 2]), 2);  
+    target_array[ii] = atoi(temp_str);
+  }
+
+  target_array[0] += 30; // YY is offset from 2000, but epoch time is offset from 1970
+}
+
+void make_datetime_filename(uint8_t src_array[4], char * target_filename, uint8_t max_len){
+  snprintf(target_filename, max_len, "%02d%02d%02d%02d.csv", 
+    src_array[0] - 30, // YY is offset from 2000, but epoch time is offset from 1970
+    src_array[1],
+    src_array[2],
+    src_array[3]);  
+}
+
+void advanceByOneHour(uint8_t src_array[4]){
+
+  tmElements_t tm;
+  tm.Year   = src_array[0];
+  tm.Month  = src_array[1];
+  tm.Day    = src_array[2];
+  tm.Wday   = 0;
+  tm.Hour   = src_array[3];
+  tm.Minute = 0;
+  tm.Second = 0;
+  
+  time_t seconds_since_epoch = makeTime(tm);;  
+  seconds_since_epoch += SECS_PER_HOUR; 
+  breakTime(seconds_since_epoch, tm);
+
+  src_array[0] = tm.Year;
+  src_array[1] = tm.Month;
+  src_array[2] = tm.Day;
+  src_array[3] = tm.Hour;
+}
+
+// does the behavior of executing the one_file_function on a single file
+// or on each file in a range of files 
+void fileop_command_delegate(char * arg, void (*one_file_function)(char *)){
+  char * first_arg = NULL;
+  char * second_arg = NULL;
+  
+  trim_string(arg);
+  
+  first_arg = strtok(arg, " ");
+  second_arg = strtok(NULL, " ");
+
+  if(second_arg == NULL){   
+    one_file_function(first_arg);
+  }
+  else {
+    uint8_t cur_date[4] = {0,0,0,0};
+    uint8_t end_date[4] = {0,0,0,0};
+    crack_datetime_filename(first_arg, cur_date);
+    crack_datetime_filename(second_arg, end_date);
+
+    // starting from cur_date, download the file with that name
+    char cur_date_filename[16] = {0};
+    boolean finished_last_file = false;
+    unsigned long previousMillis = millis();
+    const long interval = 1000;
+    while(!finished_last_file){
+      unsigned long currentMillis = millis();
+      if(currentMillis - previousMillis >= interval) {        
+        previousMillis = currentMillis;   
+        petWatchdog();
+      }
+      memset(cur_date_filename, 0, 16);
+      make_datetime_filename(cur_date, cur_date_filename, 15);
+      one_file_function(cur_date_filename);
+      if(memcmp(cur_date, end_date, 4) == 0){      
+        finished_last_file = true;
+      }
+      else{
+        advanceByOneHour(cur_date);      
+      }
+    } 
+    delayForWatchdog();    
+  }  
+}
+
+void download_command(char * arg){
+  Serial.println(header_row);
+  fileop_command_delegate(arg, download_one_file);
+  Serial.println("Info: Done downloading.");
+}
+
+void delete_one_file(char * filename){
+  if(filename != NULL && init_sdcard_ok){   
+    if (SD.remove(filename)) {
       Serial.print("Info: Removed file named \"");
-      Serial.print(arg);
+      Serial.print(filename);
       Serial.println(F("\""));
     }
-    else {
-      Serial.print("Error: Failed to delete file named \"");
-      Serial.print(arg);
-      Serial.println(F("\""));
+//    else {
+//      Serial.print("Error: Failed to delete file named \"");
+//      Serial.print(filename);
+//      Serial.println(F("\""));
+//    }    
     }    
   }
+
+void delete_command(char * arg){
+  fileop_command_delegate(arg, delete_one_file);
+  Serial.println("Info: Done deleting.");
 }
 
 void set_mqtt_password(char * arg) {
@@ -3012,6 +3189,25 @@ void set_mqtt_password(char * arg) {
   }
   else {
     Serial.println(F("Error: MQTT password must be less than 32 characters in length"));
+  }
+}
+
+void set_mqtt_topic_prefix(char * arg) {
+  if(!configMemoryUnlocked(__LINE__)){
+    return;
+  }
+  
+  // we've reserved 64-bytes of EEPROM for a MQTT prefix
+  // so the argument's length must be <= 63
+  char prefix[64] = {0};
+  uint16_t len = strlen(arg);
+  if (len < 64) {
+    strncpy(prefix, arg, len);
+    eeprom_write_block(prefix, (void *) EEPROM_MQTT_TOPIC_PREFIX, 64);
+    recomputeAndStoreConfigChecksum();
+  }
+  else {
+    Serial.println(F("Error: MQTT prefix must be less than 64 characters in length"));
   }
 }
 
@@ -3131,16 +3327,27 @@ void set_mqtt_port(char * arg) {
 }
 
 void set_update_server_name(char * arg){
+
+  static char server[32] = {0};
+  memset(server, 0, 32);
+  
   if(!configMemoryUnlocked(__LINE__)){
     return;
   }
   
+  trim_string(arg); // leading and trailing spaces are not relevant 
+  uint16_t len = strlen(arg);   
+  
   // we've reserved 32-bytes of EEPROM for an update server name
   // so the argument's length must be <= 31
-  char server[32] = {0};
-  uint16_t len = strlen(arg);
   if (len < 32) {
-    strncpy(server, arg, len);
+    strncpy(server, arg, 31); // copy the argument as a case-sensitive server name
+    lowercase(arg);           // in case it's the "disable" special case, make arg case insensitive
+    
+    if(strncmp(arg, "disable", 7) == 0){      
+      memset(server, 0, 32); // wipe out the update server name 
+    }
+    
     eeprom_write_block(server, (void *) EEPROM_UPDATE_SERVER_NAME, 32);
     recomputeAndStoreConfigChecksum();
   }
@@ -3404,35 +3611,49 @@ void set_private_key(char * arg) {
   }
 }
 
-void get_eeprom_config(uint8_t * config_buffer){
-  eeprom_read_block(config_buffer, (const void *) EEPROM_CRC_CHECKSUM, EEPROM_CONFIG_MEMORY_SIZE);
-}
-
 void recomputeAndStoreConfigChecksum(void) {
   if(!configMemoryUnlocked(__LINE__)){
     return;
   }
   
-  uint16_t crc = computeConfigChecksum();
+  uint16_t crc = computeEepromChecksum();
   eeprom_write_word((uint16_t *) EEPROM_CRC_CHECKSUM, crc);
 }
 
-uint16_t computeConfigChecksum(void) {   
-  uint8_t eeprom_config[EEPROM_CONFIG_MEMORY_SIZE] = {0};
-  get_eeprom_config(eeprom_config);
-  // don't include the checksum in the checksum calculation
-  // in other words start the calculation 2 bytes past the array start
-  // and compute the checksum over 1022 bytes (1024 - 2)
-  uint16_t crc = computeChecksum(eeprom_config + 2, EEPROM_CONFIG_MEMORY_SIZE - 2);   
+uint16_t computeEepromChecksum(void) {
+  uint16_t crc = 0;
+
+  // there are EEPROM_CONFIG_MEMORY_SIZE - 2 bytes to compute the CRC16 over
+  // the first byte is located at EEPROM_CRC_CHECKSUM + 2
+  // the last byte is located at EEPROM_CONFIG_MEMORY_SIZE - 1
+  for (uint16_t ii = 0; ii < EEPROM_CONFIG_MEMORY_SIZE - 2; ii++) {
+    uint8_t value = eeprom_read_byte((uint8_t *) (EEPROM_CRC_CHECKSUM + 2 + ii));
+    crc = _crc16_update(crc, value);
+  }
   return crc;
 }
 
-uint16_t computeChecksum(uint8_t * ram_start_address, uint16_t num_bytes) {
+uint16_t getStoredEepromChecksum(void){
+  return eeprom_read_word((const uint16_t *) EEPROM_CRC_CHECKSUM);  
+}
+
+uint16_t computeFlashChecksum(void) {
   uint16_t crc = 0;
-  for (uint16_t ii = 0; ii < num_bytes; ii++) {
-    crc = _crc16_update(crc, ram_start_address[ii]);
+  // there are EEPROM_CONFIG_MEMORY_SIZE - 2 bytes to compute the CRC16 over
+  // the first byte is located at SECOND_TO_LAST_4K_PAGE_ADDRESS + 2
+  // the last byte is located at EEPROM_CONFIG_MEMORY_SIZE - 1  
+  for (uint16_t ii = 0; ii < EEPROM_CONFIG_MEMORY_SIZE - 2; ii++) {
+    uint8_t value = flash.readByte(((uint32_t) SECOND_TO_LAST_4K_PAGE_ADDRESS) + 2UL + ((uint32_t) ii));
+    crc = _crc16_update(crc, value);
   }
   return crc;
+}
+
+uint16_t getStoredFlashChecksum(void){
+  uint16_t stored_crc = flash.readByte(((uint32_t) SECOND_TO_LAST_4K_PAGE_ADDRESS) + 1UL);
+  stored_crc <<= 8;
+  stored_crc |= flash.readByte(((uint32_t) SECOND_TO_LAST_4K_PAGE_ADDRESS) + 0UL);
+  return stored_crc;
 }
 
 /****** GAS SENSOR SUPPORT FUNCTIONS ******/
@@ -3467,7 +3688,6 @@ void safe_dtostrf(float value, signed char width, unsigned char precision, char 
     snprintf(target_buffer, target_buffer_length - 1, format_string, value);
   }
 
-    
 }
 
 void backlightOn(void) {
@@ -3629,7 +3849,7 @@ void ltrim_string(char * str){
   uint16_t num_leading_spaces = 0;
   uint16_t len = strlen(str);
   for(uint16_t ii = 0; ii < len; ii++){
-    if(str[ii] != ' '){
+    if(!isspace(str[ii])){
       break;      
     }     
     num_leading_spaces++;
@@ -3644,18 +3864,20 @@ void ltrim_string(char * str){
   }
 }
 
-void rtrim_string(char * str){
-  char * pstr = str;
-  uint16_t space_index = 0;
-
-  // find the first non-space character
-  while(*pstr == ' '){
-    pstr++;
-  }
-  
-  if(index_of(' ', pstr, &space_index)){
-    // if there's a space, null it
-    str[space_index] = '\0';
+void rtrim_string(char * str){  
+  // starting at the last character in the string
+  // overwrite space characters with null characteres
+  // until you reach a non-space character
+  // or you overwrite the entire string
+  int16_t ii = strlen(str) - 1;  
+  while(ii >= 0){
+    if(isspace(str[ii])){
+      str[ii] = '\0';
+    }
+    else{
+      break;
+    }
+    ii--;
   }
 }
 
@@ -3773,8 +3995,10 @@ void leftpad_string(char * str, uint16_t target_length){
 }
 
 void updateLCD(float value, uint8_t pos_x, uint8_t pos_y, uint8_t field_width){
-  char tmp[64] = {0};
-  char asterisks_field[17] = {0};
+  static char tmp[64] = {0};
+  static char asterisks_field[17] = {0};
+  memset(tmp, 0, 64);
+  memset(asterisks_field, 0, 17);
 
   for(uint8_t ii = 0; (ii < field_width) && (ii < 16); ii++){
      asterisks_field[ii] = '*'; 
@@ -3989,18 +4213,7 @@ uint8_t rssi_to_bars(int8_t rssi_dbm){
 }
 
 boolean restartWifi(){
-  boolean first_time = true;
-  
   if(!connectedToNetwork()){
-    
-    if(first_time){
-      first_time = false;
-    }
-    else{
-      Serial.print(F("Info: Rebooting CC3000..."));
-      cc3000.reboot();
-      Serial.println(F("OK."));
-    }
     delayForWatchdog();
     petWatchdog();
     current_millis = millis();
@@ -4050,13 +4263,19 @@ bool displayConnectionDetails(void){
 }
 
 void reconnectToAccessPoint(void){
-  char ssid[32] = {0};
-  char network_password[32] = {0};
+  static char ssid[32] = {0};
+  static char network_password[32] = {0};
+  static uint8_t connect_method = 0;
+  static uint8_t network_security_mode = 0;
+  static boolean first_access = true;
   
-  uint8_t connect_method = eeprom_read_byte((const uint8_t *) EEPROM_CONNECT_METHOD);
-  uint8_t network_security_mode = eeprom_read_byte((const uint8_t *) EEPROM_SECURITY_MODE);  
-  eeprom_read_block(ssid, (const void *) EEPROM_SSID, 31);
-  eeprom_read_block(network_password, (const void *) EEPROM_NETWORK_PWD, 31); 
+  if(first_access){
+    first_access = false;
+    connect_method = eeprom_read_byte((const uint8_t *) EEPROM_CONNECT_METHOD);
+    network_security_mode = eeprom_read_byte((const uint8_t *) EEPROM_SECURITY_MODE);  
+    eeprom_read_block(ssid, (const void *) EEPROM_SSID, 31);
+    eeprom_read_block(network_password, (const void *) EEPROM_NETWORK_PWD, 31); 
+  }
  
   switch(connect_method){
     case CONNECT_METHOD_DIRECT:
@@ -4081,14 +4300,6 @@ void reconnectToAccessPoint(void){
       lcdSmiley(15, 1);
       SUCCESS_MESSAGE_DELAY();
       break;
-    case CONNECT_METHOD_SMARTCONFIG:
-      Serial.print(F("Info: Waiting for SmartConfig to Reconnect..."));
-      while(!connectedToNetwork()){
-        ; //TODO: implement timeout, though the watchdog is an implied timeout...
-      }
-      Serial.println(F("OK."));
-      break;
-    case CONNECT_METHOD_PFOD:
     default:
       Serial.println(F("Error: Connection method not currently supported"));
       break;
@@ -4096,9 +4307,14 @@ void reconnectToAccessPoint(void){
 }
 
 void acquireIpAddress(void){
-  uint8_t static_ip_address[4] = {0};
+  static boolean first_access = true;
+  static uint8_t static_ip_address[4] = {0};
   uint8_t noip[4] = {0};
-  eeprom_read_block(static_ip_address, (const void *) EEPROM_STATIC_IP_ADDRESS, 4);
+
+  if(first_access){
+    first_access = false;
+    eeprom_read_block(static_ip_address, (const void *) EEPROM_STATIC_IP_ADDRESS, 4);
+  }
   
   // if it's DHCP we're configured for, engage DHCP process
   if (memcmp(static_ip_address, noip, 4) == 0){
@@ -4170,6 +4386,20 @@ uint32_t arrayToCC3000Ip(uint8_t * ip_array){
 // 62.5 microvolts resolution in 16-bit mode
 boolean burstSampleADC(float * result){
   #define NUM_SAMPLES_PER_BURST (8)
+
+  // autoprobe to find out which address the ADC is at in this slot
+  static uint8_t viable_addresses[8] = {0};
+  static boolean first_access = true;
+  if(first_access){
+    first_access = false;
+    // viable addresses for MCP3421 are 0x68...0x6F
+    for(uint8_t ii = 0; ii < 8; ii++){
+      viable_addresses[ii] = 0x68 + ii;
+    }
+  }
+
+  adc.autoprobe(viable_addresses, 8);
+  
   MCP342x::Config status;
   int32_t burst_sample_total = 0;
   uint8_t num_samples = 0;
@@ -4202,6 +4432,7 @@ void clearTempBuffers(void){
   memset(compensated_value_string, 0, 64);
   memset(raw_value_string, 0, 64);
   memset(scratch, 0, 512);
+  memset(MQTT_TOPIC_STRING, 0, 128);
 }
 
 boolean mqttResolve(void){
@@ -4262,6 +4493,7 @@ boolean mqttReconnect(void){
      eeprom_read_block(mqtt_username, (const void *) EEPROM_MQTT_USERNAME, 31);
      eeprom_read_block(mqtt_client_id, (const void *) EEPROM_MQTT_CLIENT_ID, 31);
      eeprom_read_block(mqtt_password, (const void *) EEPROM_MQTT_PASSWORD, 31);
+     eeprom_read_block(MQTT_TOPIC_PREFIX, (const void *) EEPROM_MQTT_TOPIC_PREFIX, 63);
      mqtt_auth_enabled = eeprom_read_byte((const uint8_t *) EEPROM_MQTT_AUTH);
      mqtt_port = eeprom_read_dword((const uint32_t *) EEPROM_MQTT_PORT);
 
@@ -4327,9 +4559,9 @@ boolean mqttPublish(char * topic, char *str){
 
 
 boolean publishHeartbeat(){
+  clearTempBuffers();
   static uint32_t post_counter = 0;  
   uint8_t sample = pgm_read_byte(&heartbeat_waveform[heartbeat_waveform_index++]);
-  memset(scratch, 0, 512);
   snprintf(scratch, 511, 
   "{"
   "\"serial-number\":\"%s\","
@@ -4343,7 +4575,9 @@ boolean publishHeartbeat(){
      heartbeat_waveform_index = 0;
   }
   
-  return mqttPublish(MQTT_TOPIC_PREFIX "heartbeat", scratch); 
+  strcat(MQTT_TOPIC_STRING, MQTT_TOPIC_PREFIX);
+  strcat(MQTT_TOPIC_STRING, "heartbeat");    
+  return mqttPublish(MQTT_TOPIC_STRING, scratch);
 }
 
 float toFahrenheit(float degC){
@@ -4352,7 +4586,7 @@ float toFahrenheit(float degC){
 
 boolean publishTemperature(){
   clearTempBuffers();
-  float temperature_moving_average = calculateAverage(sample_buffer[TEMPERATURE_SAMPLE_BUFFER], sample_buffer_depth);
+  float temperature_moving_average = calculateAverage(&(sample_buffer[TEMPERATURE_SAMPLE_BUFFER][0]), sample_buffer_depth);
   temperature_degc = temperature_moving_average;
   float raw_temperature = temperature_degc;
   float reported_temperature = temperature_degc - reported_temperature_offset_degC;
@@ -4374,12 +4608,15 @@ boolean publishTemperature(){
     "\"sensor-part-number\":\"SHT25\""
     "}", mqtt_client_id, converted_value_string, temperature_units, raw_value_string, temperature_units);
     
-  return mqttPublish(MQTT_TOPIC_PREFIX "temperature", scratch);
+  strcat(MQTT_TOPIC_STRING, MQTT_TOPIC_PREFIX);
+  strcat(MQTT_TOPIC_STRING, "temperature");    
+  return mqttPublish(MQTT_TOPIC_STRING, scratch);
 }
 
 
 
 boolean publishNoise(){
+  clearTempBuffers();
   val = analogRead(A7);
   noise_value_to_p = val;
   safe_dtostrf(val, -6, 2, converted_value_string, 16);
@@ -4390,15 +4627,17 @@ boolean publishNoise(){
     "\"converted-value\":%s,"
     "\"sensor-part-number\":\"SHT25\""
     "}", mqtt_client_id, converted_value_string);
-    
-  return mqttPublish(MQTT_TOPIC_PREFIX "noise", scratch);
+
+  strcat(MQTT_TOPIC_STRING, MQTT_TOPIC_PREFIX);
+  strcat(MQTT_TOPIC_STRING, "noise");    
+  return mqttPublish(MQTT_TOPIC_STRING, scratch);    
 }
 
 
 
 boolean publishHumidity(){
   clearTempBuffers();
-  float humidity_moving_average = calculateAverage(sample_buffer[HUMIDITY_SAMPLE_BUFFER], sample_buffer_depth);
+  float humidity_moving_average = calculateAverage(&(sample_buffer[HUMIDITY_SAMPLE_BUFFER][0]), sample_buffer_depth);
   relative_humidity_percent = humidity_moving_average;
   float raw_humidity = constrain(relative_humidity_percent, 0.0f, 100.0f);
   float reported_humidity = constrain(relative_humidity_percent - reported_humidity_offset_percent, 0.0f, 100.0f);
@@ -4416,7 +4655,10 @@ boolean publishHumidity(){
     "\"raw-units\":\"percent\","  
     "\"sensor-part-number\":\"SHT25\""
     "}", mqtt_client_id, converted_value_string, raw_value_string);  
-  return mqttPublish(MQTT_TOPIC_PREFIX "humidity", scratch);
+
+  strcat(MQTT_TOPIC_STRING, MQTT_TOPIC_PREFIX);
+  strcat(MQTT_TOPIC_STRING, "humidity");    
+  return mqttPublish(MQTT_TOPIC_STRING, scratch);
 }
 
 void collectTemperature(void){
@@ -4546,6 +4788,32 @@ void collectCO(void ){
   selectNoSlot();     
 }
 
+float pressure_scale_factor(void){
+  float ret = 1.0f;
+  
+  static boolean first_access = true;
+  static int16_t altitude_meters = 0.0f;
+  
+  if(first_access){
+    first_access = false;
+    altitude_meters = (int16_t) eeprom_read_word((uint16_t *) EEPROM_ALTITUDE_METERS);
+  }
+
+  if(altitude_meters != -1){
+    // calculate scale factor of altitude and temperature
+    const float kelvin_offset = 273.15f;
+    const float lapse_rate_kelvin_per_meter = -0.0065f;
+    const float pressure_exponentiation_constant = 5.2558774324f;
+    
+    float outside_temperature_kelvin = kelvin_offset + (temperature_degc - reported_temperature_offset_degC);
+    float outside_temperature_kelvin_at_sea_level = outside_temperature_kelvin - lapse_rate_kelvin_per_meter * altitude_meters; // lapse rate is negative
+    float pow_arg = 1.0f + ((lapse_rate_kelvin_per_meter * altitude_meters) / outside_temperature_kelvin_at_sea_level);
+    ret = powf(pow_arg, pressure_exponentiation_constant);
+  }
+  
+  return ret;
+}
+
 void no2_convert_from_volts_to_ppb(float volts, float * converted_value, float * temperature_compensated_value){
   static boolean first_access = true;
   static float no2_zero_volts = 0.0f;
@@ -4554,30 +4822,72 @@ void no2_convert_from_volts_to_ppb(float volts, float * converted_value, float *
   float temperature_compensated_slope = 0.0f;
   if(first_access){
     // NO2 has negative slope in circuit, more negative voltages correspond to higher levels of NO2
-    no2_slope_ppb_per_volt = -1.0 * eeprom_read_float((const float *) EEPROM_NO2_CAL_SLOPE); 
+    no2_slope_ppb_per_volt = eeprom_read_float((const float *) EEPROM_NO2_CAL_SLOPE); 
     no2_zero_volts = eeprom_read_float((const float *) EEPROM_NO2_CAL_OFFSET);
     first_access = false;
   }
   
-  // piecewise temperature coefficient of span for NO2
-  // -20C to 20C  0.1%/degC 
-  // 20C to 50C   0.4%/degC
-  if(temperature_degc < 20.0f){
-    temperature_coefficient_of_span = 0.001f; // 0.1%
+  // apply piecewise linear regressions
+  // to signal scaling effect curve
+  float scaling_slope = 0.0f;
+  float scaling_intercept = 0.0f;  
+  if(temperature_degc < 0.0f){                 // < 0C  
+    scaling_slope = -0.0355739076f;
+    scaling_intercept = 97.9865525718f;
   }
-  else{
-    temperature_coefficient_of_span = 0.004f; // 0.4%    
+  else if(temperature_degc < 20.0f){           // 0C .. 20C   
+    scaling_slope = 0.1702484721f;
+    scaling_intercept = 97.9953985672f; 
   }
+  else{                                        // > 20C   
+    scaling_slope = 0.3385634354f;
+    scaling_intercept = 94.6638669473f;
+  }
+  float signal_scaling_factor_at_temperature = ((scaling_slope * temperature_degc) + scaling_intercept)/100.0f;
+  // divide by 100 becauset the slope/intercept graphs have scaling factors in value
   
-  temperature_compensated_slope = no2_slope_ppb_per_volt;
-  temperature_compensated_slope /= (1.0f + (temperature_coefficient_of_span * (20 - temperature_degc)));
+  // apply piecewise linear regressions
+  // to baseline offset effect curve
+  float baseline_offset_ppm_slope = 0.0f;
+  float baseline_offset_ppm_intercept = 0.0f;
   
-  *converted_value = (volts - no2_zero_volts) * no2_slope_ppb_per_volt;
+  if(temperature_degc < 33.0f){                          // < 33C
+    baseline_offset_ppm_slope = -0.0007019288f;
+    baseline_offset_ppm_intercept = 0.0177058403f;
+  }
+  else if(temperature_degc < 38.0f){                     // 33C .. 38C
+    baseline_offset_ppm_slope = -0.0085978946f;
+    baseline_offset_ppm_intercept = 0.2777254052f;
+  }
+  else if(temperature_degc < 42.0f){                     // 38C .. 42C
+    baseline_offset_ppm_slope = -0.0196092331f;
+    baseline_offset_ppm_intercept = 0.6994563331f;    
+  }
+  else if(temperature_degc < 46.0f){                     // 42C .. 46C
+    baseline_offset_ppm_slope = -0.0351416006f;
+    baseline_offset_ppm_intercept = 1.3566041809f;          
+  }
+  else{                                                  // > 46C
+    baseline_offset_ppm_slope = -0.0531894279f;
+    baseline_offset_ppm_intercept =  2.1948987152f;        
+  }  
+  float baseline_offset_ppm_at_temperature = ((baseline_offset_ppm_slope * temperature_degc) + baseline_offset_ppm_intercept); 
+  float baseline_offset_ppb_at_temperature = baseline_offset_ppm_at_temperature * 1000.0f;
+  // multiply by 1000 because baseline offset graph shows NO2 in ppm  
+  float baseline_offset_voltage_at_temperature = -1.0f * baseline_offset_ppb_at_temperature / no2_slope_ppb_per_volt;
+  // multiply by -1 because the ppm curve goes negative but the voltage actually *increases*
+  
+  float signal_scaling_factor_at_altitude = pressure_scale_factor();
+  
+  *converted_value = (no2_zero_volts - volts) * no2_slope_ppb_per_volt;
   if(*converted_value <= 0.0f){
     *converted_value = 0.0f; 
   }
   
-  *temperature_compensated_value = (volts - no2_zero_volts) * temperature_compensated_slope;
+  *temperature_compensated_value = (no2_zero_volts - volts - baseline_offset_voltage_at_temperature) * no2_slope_ppb_per_volt 
+                                   / signal_scaling_factor_at_temperature 
+                                   / signal_scaling_factor_at_altitude;
+                                   
   if(*temperature_compensated_value <= 0.0f){
     *temperature_compensated_value = 0.0f;
   }
@@ -4586,7 +4896,7 @@ void no2_convert_from_volts_to_ppb(float volts, float * converted_value, float *
 boolean publishNO2(){
   clearTempBuffers();
   float converted_value = 0.0f, compensated_value = 0.0f;    
-  float no2_moving_average = calculateAverage(sample_buffer[NO2_SAMPLE_BUFFER], sample_buffer_depth);
+  float no2_moving_average = calculateAverage(&(sample_buffer[NO2_SAMPLE_BUFFER][0]), sample_buffer_depth);
   no2_convert_from_volts_to_ppb(no2_moving_average, &converted_value, &compensated_value);
   no2_ppb = compensated_value;  
   safe_dtostrf(no2_moving_average, -8, 5, raw_value_string, 16);
@@ -4609,7 +4919,10 @@ boolean publishNO2(){
     raw_value_string, 
     converted_value_string, 
     compensated_value_string);  
-  return mqttPublish(MQTT_TOPIC_PREFIX "no2", scratch);     
+  
+  strcat(MQTT_TOPIC_STRING, MQTT_TOPIC_PREFIX);
+  strcat(MQTT_TOPIC_STRING, "no2");    
+  return mqttPublish(MQTT_TOPIC_STRING, scratch);      
 }
 
 void co_convert_from_volts_to_ppm(float volts, float * converted_value, float * temperature_compensated_value){
@@ -4625,26 +4938,60 @@ void co_convert_from_volts_to_ppm(float volts, float * converted_value, float * 
     first_access = false;
   }
 
-  // piecewise temperature coefficient of span for NO2
-  // -20C to 20C  0.6%/degC
-  // 20C to 50C   0.4%/degC
-  if(temperature_degc < 20.0f){
-    temperature_coefficient_of_span = 0.006f; // 0.1%
+  // apply piecewise linear regressions
+  // to signal scaling effect curve
+  float scaling_slope = 0.0f;
+  float scaling_intercept = 0.0f;  
+  if(temperature_degc < 0.0f){       // < 0C
+    scaling_slope = 0.926586438f;
+    scaling_intercept = 88.2942019565f;
   }
-  else{
-    temperature_coefficient_of_span = 0.004f; // 0.4%    
+  else if(temperature_degc < 20.0f){ // 0C .. 20C
+    scaling_slope = 0.6072408915f;
+    scaling_intercept = 87.9176593244f; 
   }
+  else{                              // > 20C
+    scaling_slope = 0.2600853674f;
+    scaling_intercept = 95.6168149016f;
+  }
+  float signal_scaling_factor_at_temperature = ((scaling_slope * temperature_degc) + scaling_intercept)/100.0f;
+  // divide by 100 becauset the slope/intercept graphs have scaling factors in value
   
-  temperature_compensated_slope = co_slope_ppm_per_volt;
-  temperature_compensated_slope /= (1.0f + (temperature_coefficient_of_span * (20 - temperature_degc)));
+  // apply piecewise linear regressions
+  // to baseline offset effect curve
+  float baseline_offset_ppm_slope = 0.0f;
+  float baseline_offset_ppm_intercept = 0.0f;
   
+  if(temperature_degc < 15.5f){                          // no correction for < 15.5C
+    baseline_offset_ppm_slope = 0.0f;
+    baseline_offset_ppm_intercept = 0.0f;
+  }
+  else if(temperature_degc < 25.0f){                      // 15.5C .. 25C
+    baseline_offset_ppm_slope = 0.2590260005f;
+    baseline_offset_ppm_intercept = -4.0290395187f;
+  }
+  else if(temperature_degc < 32.0f){                      // 25C .. 32C
+    baseline_offset_ppm_slope = 0.5387700048f;
+    baseline_offset_ppm_intercept = -11.0899532317f;
+  }
+  else{                                                   // > 32C
+    baseline_offset_ppm_slope = 0.824964228f;
+    baseline_offset_ppm_intercept = -20.3665881995f;        
+  }  
+  float baseline_offset_ppm_at_temperature = (baseline_offset_ppm_slope * temperature_degc) + baseline_offset_ppm_intercept;  
+  float baseline_offset_voltage_at_temperature = baseline_offset_ppm_at_temperature / co_slope_ppm_per_volt;
+
+  float signal_scaling_factor_at_altitude = pressure_scale_factor();
   
   *converted_value = (volts - co_zero_volts) * co_slope_ppm_per_volt;
   if(*converted_value <= 0.0f){
     *converted_value = 0.0f; 
   }
   
-  *temperature_compensated_value = (volts - co_zero_volts) * temperature_compensated_slope;
+  *temperature_compensated_value = (volts - co_zero_volts - baseline_offset_voltage_at_temperature) * co_slope_ppm_per_volt 
+                                   / signal_scaling_factor_at_temperature
+                                   / signal_scaling_factor_at_altitude;
+                                   
   if(*temperature_compensated_value <= 0.0f){
     *temperature_compensated_value = 0.0f;
   }  
@@ -4652,9 +4999,8 @@ void co_convert_from_volts_to_ppm(float volts, float * converted_value, float * 
 
 boolean publishCO(){
   clearTempBuffers();
-  char compensated_value_string[64] = {0};
   float converted_value = 0.0f, compensated_value = 0.0f;   
-  float co_moving_average = calculateAverage(sample_buffer[CO_SAMPLE_BUFFER], sample_buffer_depth);
+  float co_moving_average = calculateAverage(&(sample_buffer[CO_SAMPLE_BUFFER][0]), sample_buffer_depth);
   co_convert_from_volts_to_ppm(co_moving_average, &converted_value, &compensated_value);
   co_ppm = compensated_value;  
   safe_dtostrf(co_moving_average, -8, 5, raw_value_string, 16);
@@ -4677,7 +5023,10 @@ boolean publishCO(){
     raw_value_string, 
     converted_value_string, 
     compensated_value_string);  
-  return mqttPublish(MQTT_TOPIC_PREFIX "co", scratch);
+
+  strcat(MQTT_TOPIC_STRING, MQTT_TOPIC_PREFIX);
+  strcat(MQTT_TOPIC_STRING, "co");    
+  return mqttPublish(MQTT_TOPIC_STRING, scratch);      
 }
 
 void petWatchdog(void){
@@ -4715,7 +5064,7 @@ void loop_wifi_mqtt_mode(void){
   if(current_millis - previous_mqtt_publish_millis >= reporting_interval){   
     previous_mqtt_publish_millis = current_millis;      
     
-    printCsvDataLine(NULL);
+    printCsvDataLine();
     
     if(connectedToNetwork()){
       num_mqtt_intervals_without_wifi = 0;
@@ -4731,7 +5080,8 @@ void loop_wifi_mqtt_mode(void){
         if(!publishHeartbeat()){
           Serial.println(F("Error: Failed to publish Heartbeat."));  
         }
-         if(!publishNoise()){
+
+        if(!publishNoise()){
           Serial.println(F("Error: Failed to publish Noise."));  
         }
         
@@ -4763,7 +5113,8 @@ void loop_wifi_mqtt_mode(void){
               Serial.println(F("Error: Failed to publish Humidity."));         
             }
             else{
-              updateLCD(relative_humidity_percent, 13, 0, 3);  
+              float reported_relative_humidity_percent = relative_humidity_percent - reported_humidity_offset_percent;
+              updateLCD(reported_relative_humidity_percent, 13, 0, 3);  
             }
           }
           else{
@@ -4863,7 +5214,7 @@ void loop_offline_mode(void){
 
   if(current_millis - previous_write_record_millis >= reporting_interval){   
     previous_write_record_millis = current_millis;
-    printCsvDataLine(NULL);
+    printCsvDataLine();
   }  
 }
 
@@ -4878,10 +5229,7 @@ float calculateAverage(float * buf, uint16_t num_samples){
   return average / num_samples;
 }
 
-// if the caller passes an augmented_header to printCsvDataLine
-// it's the caller's responsibility to terminate the line
-// otherwise printCsvDataLine will terminate the line implicitly
-void printCsvDataLine(const char * augmented_header){
+void printCsvDataLine(){
   static boolean first = true;
   static char dataString[512] = {0};  
   memset(dataString, 0, 512);
@@ -4890,28 +5238,10 @@ void printCsvDataLine(const char * augmented_header){
   uint16_t dataStringRemaining = 511;
   
   if(first){
-    char * header_row = "Timestamp,"
-                   "Temperature[degC],"
-                   "Humidity[percent],"                   
-                   "NO2[ppb],"                    
-                   "CO[ppm],"      
-                   "NO2[V]," 
-                   "CO[V]";        
     first = false;      
     Serial.print(F("csv: "));    
     Serial.print(header_row);
-    appendToString(header_row, dataString, &dataStringRemaining);
-          
-    if(augmented_header != 0){
-      Serial.print(F(","));
-      appendToString(",", dataString, &dataStringRemaining);
-
-      Serial.print(augmented_header);     
-      appendToString((char *) augmented_header, dataString, &dataStringRemaining);     
-    }
-    
     Serial.println();
-    appendToString("\n", dataString, &dataStringRemaining);  
   }  
   
   Serial.print(F("csv: "));
@@ -4920,7 +5250,7 @@ void printCsvDataLine(const char * augmented_header){
   appendToString("," , dataString, &dataStringRemaining);
   
   if(temperature_ready){
-    temperature_degc = calculateAverage(sample_buffer[TEMPERATURE_SAMPLE_BUFFER], sample_buffer_depth);
+    temperature_degc = calculateAverage(&(sample_buffer[TEMPERATURE_SAMPLE_BUFFER][0]), sample_buffer_depth);
     float reported_temperature = temperature_degc - reported_temperature_offset_degC;
     if(temperature_units == 'F'){
       reported_temperature = toFahrenheit(reported_temperature);
@@ -4937,9 +5267,10 @@ void printCsvDataLine(const char * augmented_header){
   appendToString("," , dataString, &dataStringRemaining);
   
   if(humidity_ready){
-    relative_humidity_percent = calculateAverage(sample_buffer[HUMIDITY_SAMPLE_BUFFER], sample_buffer_depth);
-    Serial.print(relative_humidity_percent, 2);
-    appendToString(relative_humidity_percent, 2, dataString, &dataStringRemaining);
+    relative_humidity_percent = calculateAverage(&(sample_buffer[HUMIDITY_SAMPLE_BUFFER][0]), sample_buffer_depth);
+    float reported_relative_humidity = relative_humidity_percent - reported_humidity_offset_percent;        
+    Serial.print(reported_relative_humidity, 2);
+    appendToString(reported_relative_humidity, 2, dataString, &dataStringRemaining);
   }
   else{
     Serial.print(F("---"));
@@ -4952,7 +5283,7 @@ void printCsvDataLine(const char * augmented_header){
   float no2_moving_average = 0.0f;
   if(no2_ready){
     float converted_value = 0.0f, compensated_value = 0.0f;    
-    no2_moving_average = calculateAverage(sample_buffer[NO2_SAMPLE_BUFFER], sample_buffer_depth);
+    no2_moving_average = calculateAverage(&(sample_buffer[NO2_SAMPLE_BUFFER][0]), sample_buffer_depth);
     no2_convert_from_volts_to_ppb(no2_moving_average, &converted_value, &compensated_value);
     no2_ppb = compensated_value;      
     Serial.print(no2_ppb, 2);
@@ -4969,7 +5300,7 @@ void printCsvDataLine(const char * augmented_header){
   float co_moving_average = 0.0f;
   if(co_ready){    
     float converted_value = 0.0f, compensated_value = 0.0f;   
-    co_moving_average = calculateAverage(sample_buffer[CO_SAMPLE_BUFFER], sample_buffer_depth);
+    co_moving_average = calculateAverage(&(sample_buffer[CO_SAMPLE_BUFFER][0]), sample_buffer_depth);
     co_convert_from_volts_to_ppm(co_moving_average, &converted_value, &compensated_value);
     co_ppm = compensated_value;     
     Serial.print(co_ppm, 2);
@@ -4993,14 +5324,8 @@ void printCsvDataLine(const char * augmented_header){
   Serial.print(co_moving_average, 6);
   appendToString(co_moving_average, 6, dataString, &dataStringRemaining);
   
-  if(augmented_header != 0){
-    Serial.print(F(","));
-    appendToString("," , dataString, &dataStringRemaining);
-  }
-  else{
-    Serial.println();
-    appendToString("\n", dataString, &dataStringRemaining);  
-  }
+  Serial.println();
+  appendToString("\n", dataString, &dataStringRemaining);  
   
   if((mode == SUBMODE_OFFLINE) && init_sdcard_ok){
     char filename[16] = {0};
@@ -5192,7 +5517,9 @@ uint16_t downloadFile(char * filename, void (*responseBodyProcessor)(uint8_t, bo
 }
 
 void checkForFirmwareUpdates(){ 
-  char filename[64] = {0};
+  static char filename[64] = {0};
+  memset(filename, 0, 64);
+  
   if(updateServerResolve()){
     // try and download the integrity check file up to three times    
     setLCD_P(PSTR("  CHECKING FOR  "
@@ -5300,6 +5627,11 @@ boolean updateServerResolve(void){
   if(connectedToNetwork()){ 
     if(!resolved){
       eeprom_read_block(update_server_name, (const void *) EEPROM_UPDATE_SERVER_NAME, 31);
+
+      if(strlen(update_server_name) == 0){
+        return false; // this is as indication that OTA updates are disabled
+      }
+      
       setLCD_P(PSTR("   RESOLVING"));
       updateLCD("UPDATE SERVER", 1);
       SUCCESS_MESSAGE_DELAY();
@@ -5449,15 +5781,16 @@ void commitConfigToMirroredConfig(void){
 }
 
 boolean mirrored_config_matches_eeprom_config(void){
-  boolean ret = false;
-  uint8_t mirrored_config[EEPROM_CONFIG_MEMORY_SIZE] = {0};
-  uint8_t eeprom_config[EEPROM_CONFIG_MEMORY_SIZE] = {0};
+  boolean ret = true;
   
-  get_mirrored_config(mirrored_config);
-  get_eeprom_config(eeprom_config);  
-  
-  if(memcmp(mirrored_config, eeprom_config, EEPROM_CONFIG_MEMORY_SIZE) == 0){
-    ret = true;
+  // compare each corresponding byte of the Flash into the EEPROM
+  for (uint16_t ii = 0; ii < EEPROM_CONFIG_MEMORY_SIZE; ii++) {
+    uint8_t flash_value = flash.readByte(((uint32_t) SECOND_TO_LAST_4K_PAGE_ADDRESS) + ((uint32_t) ii));
+    uint8_t eeprom_value = eeprom_read_byte((uint8_t *) (EEPROM_CRC_CHECKSUM + ii));
+    if(flash_value != eeprom_value){
+      ret = false;
+      break;
+    }
   }
   
   return ret;
@@ -5475,16 +5808,10 @@ boolean configMemoryUnlocked(uint16_t call_id){
 
 boolean mirrored_config_integrity_check(){
   boolean ret = false;
-  uint8_t mirrored_config[EEPROM_CONFIG_MEMORY_SIZE] = {0};
-  
-  get_mirrored_config(mirrored_config); // read the mirrored config into RAM
-  
-  uint16_t computed_crc = computeChecksum(mirrored_config + 2, 1022); // calculate its checksum
+  uint16_t computed_crc = computeFlashChecksum();
   
   // interpret the CRC, little endian
-  uint16_t stored_crc = mirrored_config[1];
-  stored_crc <<= 8;
-  stored_crc |= mirrored_config[0];
+  uint16_t stored_crc = getStoredFlashChecksum();
   
   if(stored_crc == computed_crc){
     ret = true; 
@@ -5499,9 +5826,11 @@ void mirrored_config_restore(void){
     return;
   }
   
-  uint8_t mirrored_config[EEPROM_CONFIG_MEMORY_SIZE] = {0};
-  get_mirrored_config(mirrored_config);
-  eeprom_write_block(mirrored_config, (void *) EEPROM_CRC_CHECKSUM, EEPROM_CONFIG_MEMORY_SIZE);
+  // copy each byte from the Flash into the EEPROM
+  for (uint16_t ii = 0; ii < EEPROM_CONFIG_MEMORY_SIZE; ii++) {
+    uint8_t value = flash.readByte(((uint32_t) SECOND_TO_LAST_4K_PAGE_ADDRESS) + ((uint32_t) ii));
+    eeprom_write_byte((uint8_t *) (EEPROM_CRC_CHECKSUM + ii), value);
+  }
 }
 
 boolean mirrored_config_restore_and_validate(void){
@@ -5524,16 +5853,15 @@ boolean mirrored_config_restore_and_validate(void){
   return integrity_check_passed;
 }
 
-#define SECOND_TO_LAST_4K_PAGE_ADDRESS      0x7E000     // the start address of the second to last 4k page
 void mirrored_config_copy_from_eeprom(void){
-  uint8_t eeprom_config[EEPROM_CONFIG_MEMORY_SIZE] = {0};
-  get_eeprom_config(eeprom_config);  
+  
   mirrored_config_erase();
   Serial.print(F("Info: Writing mirrored config..."));
-  uint16_t offset = 0;
-  while(offset < EEPROM_CONFIG_MEMORY_SIZE){
-    flash.writeBytes(SECOND_TO_LAST_4K_PAGE_ADDRESS + offset, eeprom_config + offset, 256);   
-    offset += 256; 
+
+  // copy each byte from the EEPROM into the Flash
+  for (uint16_t ii = 0; ii < EEPROM_CONFIG_MEMORY_SIZE; ii++) {
+    uint8_t value = eeprom_read_byte((uint8_t *) (EEPROM_CRC_CHECKSUM + ii));
+    flash.writeByte(((uint32_t) SECOND_TO_LAST_4K_PAGE_ADDRESS) + ((uint32_t) ii), value);    
   }
   Serial.println(F("OK."));
 }
@@ -5542,10 +5870,6 @@ void mirrored_config_erase(void){
   Serial.print(F("Info: Erasing mirrored config..."));  
   flash.blockErase4K(SECOND_TO_LAST_4K_PAGE_ADDRESS);
   Serial.println(F("OK."));  
-}
-
-void get_mirrored_config(uint8_t * config_buffer){
-  flash.readBytes(SECOND_TO_LAST_4K_PAGE_ADDRESS, config_buffer, EEPROM_CONFIG_MEMORY_SIZE);
 }
 
 /****** TIMESTAMPING SUPPORT FUNCTIONS ******/
